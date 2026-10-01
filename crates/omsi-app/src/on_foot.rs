@@ -547,10 +547,6 @@ impl App {
             h.avatar_remove(AVATAR_KEY);
         }
         self.view = if f.view_before == "outside" || f.view_before == "driver" { f.view_before } else { "driver".into() };
-        // (the eyes glide from where the walker's were into the cab camera)
-        if self.view == "driver" {
-            self.cam_blend.entering = true;
-        }
         self.sync_view_look();
         self.look = (0.0, 0.0);
         // (the walking keys' help goes with the walking: it stood over the cab view)

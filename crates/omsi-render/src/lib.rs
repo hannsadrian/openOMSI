@@ -2,6 +2,7 @@
 
 pub mod atmosphere;
 pub mod clouds;
+mod puddles;
 
 use anyhow::{anyhow, Context, Result};
 use glam::{DVec3, Mat4, Vec3, Vec4};
@@ -114,6 +115,8 @@ struct HdrTargets {
     /// Tone mapping with the adapted exposure in `adapt[k]`.
     tonemap_bg: [wgpu::BindGroup; 2],
     fxaa_bg: wgpu::BindGroup,
+    /// Allocated only when wet roads need scene reflections in the main view.
+    puddles: Option<puddles::Targets>,
 }
 
 /// The enhanced path's reflection probe: a cube map of the sky around the camera with a
@@ -527,6 +530,14 @@ pub struct Lighting {
     /// The player's vehicle (origin, heading in degrees, `[boundingbox]` w l h cx cy cz):
     /// no rain sheen or snow cover is shaded inside it.
     pub inside: Option<(DVec3, f64, [f32; 6])>,
+    /// Actual road height beneath the player's vehicle; independent of suspension motion.
+    /// The local puddle capture is skipped when no road height is known.
+    pub puddle_ground: Option<f64>,
+    /// Upward normal of that actual road face (including road grade and camber).
+    pub puddle_normal: Vec3,
+    /// Coupled parts of the player's vehicle (same layout as `inside`). Their own
+    /// origins keep shared AI meshes out of the local puddle capture.
+    pub puddle_parts: Vec<(DVec3, f64, [f32; 6])>,
     /// Procedural (fractal) detail texturing of the ground and roads up close - the
     /// `detail_textures` setting; independent of `enhanced`.
     pub detail: bool,
@@ -591,6 +602,9 @@ impl Default for Lighting {
             enhanced: false,
             classic: false,
             inside: None,
+            puddle_ground: None,
+            puddle_normal: Vec3::Z,
+            puddle_parts: Vec::new(),
             detail: true,
             overcast: 0.0,
             rain: 0.0,
@@ -1212,6 +1226,7 @@ pub struct Renderer {
     pub options: RenderOptions,
     /// Enhanced path: the HDR targets per size, the post pipelines and their resources.
     hdr_targets: HashMap<(u32, u32), HdrTargets>,
+    puddles: Option<puddles::Pipelines>,
     post: PostPipelines,
     post_layout: wgpu::BindGroupLayout,
     post_buf: wgpu::Buffer,
@@ -1317,6 +1332,9 @@ pub struct Renderer {
     /// Sort the blended draws by origin distance alone, as before the camera-enclosing
     /// objects were drawn last (only for before/after pictures, `OMSI_BLEND_AB`).
     pub blend_by_origin: bool,
+    /// Draw the models' `[isshadow]` shadow blobs (see [`RenderOptions::shadow_blobs`]).
+    /// Settable while the game runs, so the graphics list can switch it off at once.
+    pub shadow_blobs: bool,
     /// GPU time per pass (OMSI_GPU_TIMERS, when the device has timestamp queries): the
     /// mirrors and the window's picture apart, each timed on its own.
     gpu_timers: [Option<GpuTimers>; 2],
@@ -1387,6 +1405,11 @@ pub struct RenderOptions {
     /// Only the meshes the models mark `[shadow]` cast sun shadows, as in OMSI 2 (else every
     /// solid mesh does).
     pub omsi_shadow_casters: bool,
+    /// Draw the models' `[isshadow]` shadow meshes - OMSI's flat blob under a vehicle,
+    /// standing in for the sky light the body keeps off the road (see [`Instance::blob`]).
+    /// Off, the sun shadow map is all the shading under a vehicle, and the blob (which
+    /// OMSI draws whatever the depth) cannot be seen at all.
+    pub shadow_blobs: bool,
     /// The materials' reflection maps (`[matl_envmap]`: the shine of paint, chrome and
     /// glass). Off, nothing mirrors the sky photo - some players find it too strong.
     pub reflections: bool,
@@ -1410,6 +1433,7 @@ impl Default for RenderOptions {
             min_obj_size: 0.013,
             max_obj_dist: 0.0,
             omsi_shadow_casters: false,
+            shadow_blobs: true,
             reflections: true,
             no_enhanced: false,
         }
@@ -1435,9 +1459,10 @@ pub const LAMP_CODE_STRIDE: u32 = 64;
 /// The enhanced pass's second target: r is 1 where the bus's own screens are
 /// (`MaterialExtra::screen`), 0 elsewhere - the glow takes no light from them and FXAA
 /// passes them through; g is 1 on an LED panel's own dots (`MaterialExtra::led`), which the
-/// glow's source keeps and multiplies up (see `post.wgsl`). (Two channels, not one: an
-/// R8Unorm target drops what a shader writes into its g.)
-const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
+/// glow's source keeps and multiplies up (see `post.wgsl`). b carries the puddle's
+/// reflected-light weight; a is blend coverage. Sharing this attachment avoids another
+/// geometry pass or a full normal/material buffer just for water.
+const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// The colour targets of a pipeline drawing into `format`: in the enhanced pass (the only
@@ -1639,18 +1664,19 @@ impl Renderer {
             })
             .unwrap_or(wgpu::TextureFormat::Rgba8UnormSrgb);
         // Every target the scene is drawn into with multisampling (the swap chain or mirror
-        // format, the HDR target of the enhanced path, the depth buffer) must take the
-        // sample count, and the colour targets must resolve. A device judges that by the
-        // WebGPU table, which promises only 1x and 4x, unless it was asked for the
-        // adapter's own table: the launcher's "2x MSAA" (which Apple GPUs do support) was
-        // a fatal validation error before the first frame because the adapter's table said
-        // yes and the device's said no. So the adapter's table is asked for when the wanted
-        // count needs it, and the count is checked against the table the device will use.
+        // format, the HDR target of the enhanced path and its screen mask, the depth buffer)
+        // must take the sample count, and the colour targets must resolve. A device judges
+        // that by the WebGPU table, which promises only 1x and 4x, unless it was asked for
+        // the adapter's own table: the launcher's "2x MSAA" (which Apple GPUs do support)
+        // was a fatal validation error before the first frame because the adapter's table
+        // said yes and the device's said no. So the adapter's table is asked for when the
+        // wanted count needs it (2x, 8x), and the count is checked against the table the
+        // device will use.
         let wanted = match options.msaa {
             1 | 2 | 4 | 8 => options.msaa,
             _ => MSAA,
         };
-        let targets = [format, wgpu::TextureFormat::Rgba16Float, DEPTH_FORMAT];
+        let targets = [format, wgpu::TextureFormat::Rgba16Float, DEPTH_FORMAT, MASK_FORMAT];
         let takes = |flags: wgpu::TextureFormatFeatureFlags, f: wgpu::TextureFormat, n: u32| {
             flags.sample_count_supported(n)
                 && (n == 1
@@ -1725,10 +1751,11 @@ impl Renderer {
         let options = RenderOptions {
             msaa,
             shadow_size,
-            // (at most 8x: at 16x the sharper mip the filter picks far down a road let the
-            // dashes of a lane line alias into two blurred streaks running apart like an
-            // arrow - one line near, two further off, seen on every long straight)
-            anisotropy: options.anisotropy.clamp(1, 8),
+            // (16x was held at 8x once, for lane-line dashes far down a road seen to alias
+            // into two streaks running apart like an arrow; Spandau's Heerstrasse at 8x and
+            // 16x showed none of it - 16x kept the far dashes narrow where 8x smeared them
+            // sideways - so 16x is the player's choice again, 8x the default)
+            anisotropy: options.anisotropy.clamp(1, 16),
             ..options
         };
         let bc = device
@@ -3760,6 +3787,10 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let gpu_timers = [GpuTimers::new(&device), GpuTimers::new(&device)];
+        // GLES cannot reliably read the depth buffer (the same limitation as SSAO).
+        let puddles = (!gl && !leave_out_enhanced).then(|| {
+            puddles::Pipelines::new(&device, &shader, &camera_layout, &material_layout)
+        });
         Renderer {
             _device_poller: DevicePoller::start(&device),
             upscale_pipeline,
@@ -3790,6 +3821,7 @@ impl Renderer {
             lm_uniform,
             lm_place: std::cell::Cell::new((0.0, 0.0, 0.0)),
             hdr_targets: HashMap::new(),
+            puddles,
             post,
             post_layout,
             post_buf,
@@ -3854,6 +3886,7 @@ impl Renderer {
             shadow_sampler,
             shadow_layout,
             shadow_pipelines,
+            shadow_blobs: options.shadow_blobs,
             options,
             gpu_error,
             env_heading: Default::default(),
@@ -5779,7 +5812,8 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING
+                | if self.puddles.is_some() { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() },
             view_formats: &[],
         });
         // the AO itself at half size: four times fewer pixels, and the blur hides the rest
@@ -6017,6 +6051,7 @@ impl Renderer {
                 meter_bg,
                 tonemap_bg,
                 fxaa_bg,
+                puddles: None,
             },
         );
         true
@@ -6208,7 +6243,9 @@ impl Renderer {
             sun_disc: st.sun_disc.extend(dt).to_array(),
             debug: [
                 debug_view(),
-                0.0,
+                omsi_cfg::env::var("OMSI_PUDDLE_F0")
+                    .ok().and_then(|v| v.parse::<f32>().ok())
+                    .filter(|v| v.is_finite()).unwrap_or(0.08).clamp(0.02, 0.2),
                 omsi_cfg::env::var("OMSI_ENV_PHOTO")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -7057,9 +7094,10 @@ impl Renderer {
         cursor_overlay: Option<usize>,
         tooltip_overlay: Option<usize>,
         cursor_transforms: [Option<Mat4>; 2],
+        navigator: Option<(TextureId, [Mat4; 2])>,
     ) {
         let Some(menu) = scene.overlays.get(menu_range) else { return };
-        if menu.is_empty() && cursor_transforms.iter().all(Option::is_none) {
+        if menu.is_empty() && cursor_transforms.iter().all(Option::is_none) && navigator.is_none() {
             return;
         }
         let (w, h) = (desktop_size.0.max(1) as f32, desktop_size.1.max(1) as f32);
@@ -7085,6 +7123,12 @@ impl Renderer {
         };
         let mut prepared = [Vec::new(), Vec::new()];
         for eye in 0..2 {
+            if let Some((id, transforms)) = navigator.as_ref() {
+                let quad = [Vec4::new(-1.0, 1.0, 0.0, 1.0), Vec4::new(1.0, 1.0, 0.0, 1.0),
+                            Vec4::new(1.0, -1.0, 0.0, 1.0), Vec4::new(-1.0, -1.0, 0.0, 1.0)]
+                    .map(|p| transforms[eye] * p);
+                if let Some(item) = prepare(id, quad) { prepared[eye].push(item); }
+            }
             for (index, (id, rect)) in menu.iter().enumerate() {
                 // The first rectangle dims the view. Every other rectangle is
                 // projected from the same menu plane in world space.
@@ -7585,6 +7629,12 @@ impl Renderer {
         let probe_redraw = enhanced
             && (with_overlays || self.sky_state.is_none())
             && self.prepare_enhanced(lighting, cam_rel, ro, dt);
+        let puddles_wanted = enhanced
+            && with_overlays
+            && self.options.reflections
+            && lighting.wetness * (1.0 - lighting.snow.clamp(0.0, 1.0)) > 0.05
+            && debug_view() == 0.0
+            && omsi_cfg::env::var_os("OMSI_NO_PUDDLE_REFLECTIONS").is_none();
         // --- what every pass draws, as batches over one draw list (see `Batch`): the shadow
         // casters of each cascade, the depth prepass and the main pass. The list is built
         // and uploaded before any pass is encoded.
@@ -7808,6 +7858,10 @@ impl Renderer {
             let inst = &scene.instances[i];
             let m = &scene.meshes[inst.mesh];
             if m.ranges.is_empty() || !inst.visible || (inst.mirror_only && main_view) {
+                return None;
+            }
+            // OMSI's `[isshadow]` shadow blobs, switched off (see `RenderOptions::shadow_blobs`)
+            if inst.blob && !self.shadow_blobs {
                 return None;
             }
             let (c, r) = Self::bounding_sphere(scene, inst);
@@ -8278,6 +8332,13 @@ impl Renderer {
             list.extend(pre_list);
             prepass_batches = pre_batches;
         }
+        // OMSI_SKIP_PIPE=3,1: leave pipeline kinds out of the main pass (0 opaque, 1 alpha
+        // tested, 2 blended, 3 blended without depth writes, 4 surface depth) - with
+        // OMSI_GPU_TIMERS_RAW, what each kind costs the GPU
+        if let Ok(skip) = omsi_cfg::env::var("OMSI_SKIP_PIPE") {
+            let skip: Vec<u8> = skip.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            main_batches.retain(|b| !skip.contains(&(b.pipe / 4)));
+        }
         if debug_draws {
             log::info!("  main pass: {} opaque/alpha-tested and {} blended draws in {} batches; prepass {} batches; draw list {} entries", main_draws[0], main_draws[1], main_batches.len(), prepass_batches.len(), list.len());
         }
@@ -8307,17 +8368,24 @@ impl Renderer {
         }
         if self.profiling && with_overlays && self.draw_audit_at.elapsed().as_secs() >= 10 {
             self.draw_audit_at = std::time::Instant::now();
-            let mut assets: HashMap<&str, (usize, usize)> = HashMap::new();
+            // (batches, draws, triangles) per asset: what the CPU encodes and what the GPU
+            // goes through
+            let mut assets: HashMap<&str, (usize, usize, u64)> = HashMap::new();
             for b in &main_batches {
                 let source = scene.meshes[b.mesh as usize].source.as_deref().unwrap_or("procedural / vehicle");
                 let cost = assets.entry(source).or_default();
                 cost.0 += 1;
                 cost.1 += b.instances.len();
+                cost.2 += b.count as u64 / 3 * b.instances.len() as u64;
             }
             let mut assets: Vec<_> = assets.into_iter().collect();
             assets.sort_unstable_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(b.0)));
-            for (source, (batches, draws)) in assets.into_iter().take(12) {
-                log::info!("draw audit: {batches} batches, {draws} draws: {source}");
+            for (source, (batches, draws, tris)) in assets.iter().take(12) {
+                log::info!("draw audit: {batches} batches, {draws} draws, {tris} triangles: {source}");
+            }
+            assets.sort_unstable_by(|a, b| b.1.2.cmp(&a.1.2).then(a.0.cmp(b.0)));
+            for (source, (batches, draws, tris)) in assets.iter().take(12) {
+                log::info!("triangle audit: {tris} triangles in {draws} draws ({batches} batches): {source}");
             }
         }
         stage(self, "items", "mirror.items");
@@ -8839,6 +8907,14 @@ impl Renderer {
                 }
             }
         }
+        // Weather alone is insufficient: leave the allocation and reflection passes out when
+        // the visible batches contain no moisture-tagged surface (a showroom, bare terrain).
+        let puddles_on = puddles_wanted
+            && main_batches.iter().any(|b| scene.materials[b.material as usize].uniform.params2[2] > 0.0)
+            && self.prepare_puddle_reflections(width, height, camera, aspect, projection, &cu, lighting);
+        if puddles_on {
+            self.encode_puddle_reflections(&mut encoder, width, height, scene, &main_batches, &list, lighting, camera, tset.as_ref(), &mut timed);
+        }
         if enhanced {
             // --- the post passes: glow, metering and adaptation, tone curve, FXAA
             let secs = |tau: f32| {
@@ -8876,6 +8952,7 @@ impl Renderer {
             // (a mirror's small picture goes without FXAA)
             let fxaa = with_overlays && self.options.fxaa && omsi_cfg::env::var_os("OMSI_NO_FXAA").is_none();
             if let Some(h) = self.hdr_targets.get(&(width, height)) {
+                let puddles = h.puddles.as_ref().filter(|_| puddles_on);
                 let levels = h.down.len();
                 for i in 0..levels {
                     post_pass(
@@ -8887,7 +8964,7 @@ impl Renderer {
                         } else {
                             &self.post.down
                         },
-                        &h.down_bg[i],
+                        if i == 0 { puddles.map(|p| &p.down_bg).unwrap_or(&h.down_bg[i]) } else { &h.down_bg[i] },
                     );
                 }
                 // the exposure: meter the smallest level, move the adapted value towards it
@@ -8927,7 +9004,7 @@ impl Renderer {
                     post_pass(&mut encoder, &h.up[i], timer, &self.post.up, &h.up_bg[i]);
                 }
                 let final_view = if fxaa { &h.ldr } else { scene_view };
-                let tonemap_bg = &h.tonemap_bg[self.adapt_front];
+                let tonemap_bg = &puddles.map(|p| &p.tonemap_bg).unwrap_or(&h.tonemap_bg)[self.adapt_front];
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("tone map"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -9617,6 +9694,7 @@ fn scene_shader_source(gl: bool) -> String {
     let src = [
         include_str!("shader.wgsl"),
         include_str!("enhanced_common.wgsl"),
+        include_str!("puddle_common.wgsl"),
         include_str!("enhanced.wgsl"),
     ]
     .join("\n");
@@ -11330,6 +11408,7 @@ mod tests {
             ("corona", corona_shader_source()),
             ("post", include_str!("post.wgsl").to_string()),
             ("ssao", include_str!("ssao.wgsl").to_string()),
+            ("puddles", puddles::shader_source()),
             ("upscale", include_str!("upscale.wgsl").to_string()),
             ("mip", include_str!("mip.wgsl").to_string()),
             ("xr_ui", include_str!("xr_ui.wgsl").to_string()),
@@ -11337,6 +11416,8 @@ mod tests {
         let sizes: &[(&str, usize)] = &[
             ("Enhanced", std::mem::size_of::<EnhancedUniform>()),
             ("PostParams", std::mem::size_of::<PostUniform>()),
+            ("PuddleParams", std::mem::size_of::<puddles::Uniform>()),
+            ("VehicleReflection", std::mem::size_of::<puddles::VehicleUniform>()),
             ("PointLight", std::mem::size_of::<GpuPointLight>()),
             ("Camera", std::mem::size_of::<CameraUniform>()),
             ("MaterialParams", std::mem::size_of::<MaterialUniform>()),
